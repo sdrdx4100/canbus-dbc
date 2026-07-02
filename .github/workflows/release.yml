@@ -1,57 +1,78 @@
 name: Release
 
+# Three ways to cut a release (tag pushes may be restricted in some
+# environments, hence the alternatives):
+#   1. Push a tag `v*`
+#   2. Manually dispatch with a `tag` input
+#   3. Push a commit whose message starts with `release:` — the tag is
+#      derived from the version in Cargo.toml
 on:
   push:
     tags: ["v*"]
+    branches: ["main", "claude/**"]
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag (e.g. v0.1.0). Created on this commit if it does not exist."
         required: true
 
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-
 permissions:
   contents: write
 
 jobs:
   windows:
+    if: >-
+      github.event_name != 'push' ||
+      github.ref_type == 'tag' ||
+      startsWith(github.event.head_commit.message, 'release:')
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+          fi
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --release
       - name: Build release exe
         run: cargo build --release
       - name: Rename artifact
-        shell: pwsh
-        run: Copy-Item target/release/blf_decoder.exe "blf_decoder-$env:RELEASE_TAG-windows-x64.exe"
+        shell: bash
+        run: cp target/release/blf_decoder.exe "blf_decoder-${{ steps.tag.outputs.tag }}-windows-x64.exe"
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: BLF Decoder ${{ env.RELEASE_TAG }}
+          name: BLF Decoder ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
-            blf_decoder-${{ env.RELEASE_TAG }}-windows-x64.exe
+            blf_decoder-${{ steps.tag.outputs.tag }}-windows-x64.exe
 
   linux:
-    runs-on: ubuntu-latest
     needs: windows
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release
       - name: Rename artifact
-        run: cp target/release/blf_decoder "blf_decoder-${RELEASE_TAG}-linux-x64"
+        run: cp target/release/blf_decoder "blf_decoder-${{ needs.windows.outputs.tag }}-linux-x64"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
+          tag_name: ${{ needs.windows.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: |
-            blf_decoder-${{ env.RELEASE_TAG }}-linux-x64
+            blf_decoder-${{ needs.windows.outputs.tag }}-linux-x64
