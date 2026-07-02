@@ -1,0 +1,20 @@
+[package]
+name = "blf_decoder"
+version = "0.1.0"
+edition = "2024"
+description = "Decode Vector BLF CAN logs with a DBC file and export CSV/Parquet"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+eframe = "0.35"
+flate2 = "1.1"
+parquet = { version = "59.0", default-features = false, features = ["snap"] }
+rfd = "0.17"
+ryu = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
