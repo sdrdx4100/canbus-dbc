@@ -1,7 +1,7 @@
 //! End-to-end tests: synthesize a BLF file, decode with a DBC, check the
 //! CSV and Parquet outputs.
 
-use blf_decoder::convert::{convert, output_path};
+use blf_decoder::convert::{ConvertOptions, OutputLayout, TimestampMode, convert, output_path};
 use blf_decoder::export::OutputFormat;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -108,10 +108,27 @@ fn setup(name: &str) -> Fixture {
 
 const T0: f64 = 1704164645.0; // 2024-01-02 03:04:05 UTC
 
+/// Options matching the v0.1 behaviour: one row per frame, epoch timestamps.
+fn raw_epoch(format: OutputFormat) -> ConvertOptions {
+    ConvertOptions {
+        format,
+        layout: OutputLayout::PerFrame,
+        timestamp: TimestampMode::EpochSeconds,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn csv_roundtrip() {
     let fx = setup("csv");
-    let summary = convert(&fx.blf, &fx.dbc, &fx.dir, OutputFormat::Csv, &mut |_| {}).unwrap();
+    let summary = convert(
+        &fx.blf,
+        &fx.dbc,
+        &fx.dir,
+        raw_epoch(OutputFormat::Csv),
+        &mut |_| {},
+    )
+    .unwrap();
     assert_eq!(summary.frames_read, 3);
     assert_eq!(summary.frames_decoded, 2);
     assert_eq!(summary.signal_columns, 3);
@@ -147,7 +164,7 @@ fn parquet_roundtrip() {
         &fx.blf,
         &fx.dbc,
         &fx.dir,
-        OutputFormat::Parquet,
+        raw_epoch(OutputFormat::Parquet),
         &mut |_| {},
     )
     .unwrap();
@@ -199,12 +216,57 @@ fn parquet_roundtrip() {
 fn progress_reaches_completion() {
     let fx = setup("progress");
     let mut last = None;
-    convert(&fx.blf, &fx.dbc, &fx.dir, OutputFormat::Csv, &mut |p| {
-        last = Some(p);
-    })
+    convert(
+        &fx.blf,
+        &fx.dbc,
+        &fx.dir,
+        raw_epoch(OutputFormat::Csv),
+        &mut |p| {
+            last = Some(p);
+        },
+    )
     .unwrap();
     let last = last.unwrap();
     assert_eq!(last.bytes_read, last.total_bytes);
     assert!((last.fraction() - 1.0).abs() < f32::EPSILON);
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn resampled_csv_forward_fills() {
+    let fx = setup("resample");
+    // Frames: Engine @0.1s (836 rpm, -10 degC), Vehicle @0.2s (60 km/h).
+    // Default options: 100 ms grid, relative timestamps, forward fill.
+    let summary = convert(
+        &fx.blf,
+        &fx.dbc,
+        &fx.dir,
+        ConvertOptions::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Timestamp,EngineSpeed,EngineTemp,VehicleSpeed");
+    // Grid anchored at first decoded frame (t = 0.1 s):
+    //   row 1: t=0.1 grid closed when 0.2s frame arrives -> engine values only
+    //   row 2: t=0.2 trailing flush -> engine values held + vehicle speed
+    assert_eq!(lines.len(), 3);
+    assert_eq!(summary.rows_written, 2);
+
+    let row1: Vec<&str> = lines[1].split(',').collect();
+    assert!((row1[0].parse::<f64>().unwrap() - 0.1).abs() < 1e-9);
+    assert_eq!(row1[1].parse::<f64>().unwrap(), 836.0);
+    assert_eq!(row1[2].parse::<f64>().unwrap(), -10.0);
+    assert_eq!(row1[3], "");
+
+    let row2: Vec<&str> = lines[2].split(',').collect();
+    assert!((row2[0].parse::<f64>().unwrap() - 0.2).abs() < 1e-9);
+    // Forward-filled from the previous frame:
+    assert_eq!(row2[1].parse::<f64>().unwrap(), 836.0);
+    assert_eq!(row2[2].parse::<f64>().unwrap(), -10.0);
+    assert!((row2[3].parse::<f64>().unwrap() - 60.0).abs() < 1e-9);
+
     std::fs::remove_dir_all(&fx.dir).ok();
 }

@@ -4,7 +4,7 @@
 mod gui;
 
 use anyhow::{Context, Result, bail};
-use blf_decoder::convert::{Progress, convert};
+use blf_decoder::convert::{ConvertOptions, OutputLayout, Progress, TimestampMode, convert};
 use blf_decoder::export::OutputFormat;
 use std::path::PathBuf;
 
@@ -16,8 +16,11 @@ fn main() -> Result<()> {
     run_cli(&args)
 }
 
-const USAGE: &str =
-    "Usage: blf_decoder --blf <file.blf> --dbc <file.dbc> --out <dir> [--format csv|parquet]
+const USAGE: &str = "Usage: blf_decoder --blf <file.blf> --dbc <file.dbc> --out <dir>
+       [--format csv|parquet]      output format          (default: csv)
+       [--layout resample|raw]     table shape            (default: resample)
+       [--interval-ms <n>]         resample grid spacing  (default: 100)
+       [--timestamp relative|epoch] Timestamp column      (default: relative)
 Run without arguments to start the GUI.";
 
 /// Minimal CLI (development aid / future extension per the requirements).
@@ -25,7 +28,7 @@ fn run_cli(args: &[String]) -> Result<()> {
     let mut blf: Option<PathBuf> = None;
     let mut dbc: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
-    let mut format = OutputFormat::Csv;
+    let mut options = ConvertOptions::default();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -34,10 +37,31 @@ fn run_cli(args: &[String]) -> Result<()> {
             "--dbc" | "-d" => dbc = it.next().map(PathBuf::from),
             "--out" | "-o" => out = it.next().map(PathBuf::from),
             "--format" | "-f" => {
-                format = match it.next().map(String::as_str) {
+                options.format = match it.next().map(String::as_str) {
                     Some("csv") => OutputFormat::Csv,
                     Some("parquet") => OutputFormat::Parquet,
                     other => bail!("unknown format {other:?}\n{USAGE}"),
+                }
+            }
+            "--layout" | "-l" => {
+                options.layout = match it.next().map(String::as_str) {
+                    Some("resample") => OutputLayout::Resampled,
+                    Some("raw") => OutputLayout::PerFrame,
+                    other => bail!("unknown layout {other:?}\n{USAGE}"),
+                }
+            }
+            "--interval-ms" | "-i" => {
+                options.resample_ms = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v| *v > 0.0)
+                    .with_context(|| format!("invalid --interval-ms\n{USAGE}"))?;
+            }
+            "--timestamp" | "-t" => {
+                options.timestamp = match it.next().map(String::as_str) {
+                    Some("relative") => TimestampMode::RelativeSeconds,
+                    Some("epoch") => TimestampMode::EpochSeconds,
+                    other => bail!("unknown timestamp mode {other:?}\n{USAGE}"),
                 }
             }
             "--help" | "-h" => {
@@ -59,11 +83,12 @@ fn run_cli(args: &[String]) -> Result<()> {
             last_percent = percent;
         }
     };
-    let summary = convert(&blf, &dbc, &out, format, &mut on_progress)?;
+    let summary = convert(&blf, &dbc, &out, options, &mut on_progress)?;
     eprintln!();
     println!(
-        "Done: {} ({} of {} frames decoded, {} signal columns)",
+        "Done: {} ({} rows, {} of {} frames decoded, {} signal columns)",
         summary.output_path.display(),
+        summary.rows_written,
         summary.frames_decoded,
         summary.frames_read,
         summary.signal_columns

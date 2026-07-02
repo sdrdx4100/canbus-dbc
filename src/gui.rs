@@ -1,20 +1,26 @@
-//! Desktop GUI (eframe/egui): pick a BLF, a DBC and an output folder, choose
-//! the format, convert with live progress. The conversion runs on a worker
-//! thread and reports back over a channel so the UI stays responsive.
+//! Desktop GUI (eframe/egui).
+//!
+//! Layout: input files -> output settings -> run. Files can also be dropped
+//! onto the window. The conversion runs on a worker thread and reports back
+//! over a channel so the UI stays responsive.
 
-use blf_decoder::convert::{Progress, Summary, convert};
+use blf_decoder::convert::{
+    ConvertOptions, OutputLayout, Progress, Summary, TimestampMode, convert,
+};
 use blf_decoder::export::OutputFormat;
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 340.0])
-            .with_min_inner_size([480.0, 300.0])
+            .with_inner_size([640.0, 480.0])
+            .with_min_inner_size([560.0, 420.0])
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -23,6 +29,10 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let japanese = install_cjk_font(&cc.egui_ctx);
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+                style.spacing.button_padding = egui::vec2(12.0, 6.0);
+            });
             Ok(Box::new(App::new(japanese)))
         }),
     )
@@ -75,30 +85,55 @@ fn install_cjk_font(ctx: &egui::Context) -> bool {
 
 /// UI strings, Japanese when a CJK-capable font is available.
 struct Labels {
+    section_input: &'static str,
+    section_output: &'static str,
     blf_file: &'static str,
     dbc_file: &'static str,
     out_dir: &'static str,
     format: &'static str,
+    layout: &'static str,
+    layout_resample: &'static str,
+    layout_raw: &'static str,
+    interval_suffix: &'static str,
+    timestamp: &'static str,
+    ts_relative: &'static str,
+    ts_epoch: &'static str,
     browse: &'static str,
     convert: &'static str,
     converting: &'static str,
+    frames_unit: &'static str,
+    open_folder: &'static str,
+    drop_hint: &'static str,
     done: fn(&Summary) -> String,
     error_prefix: &'static str,
     not_selected: &'static str,
 }
 
 const JA: Labels = Labels {
-    blf_file: "BLFファイル",
-    dbc_file: "DBCファイル",
+    section_input: "入力",
+    section_output: "出力",
+    blf_file: "BLF ファイル",
+    dbc_file: "DBC ファイル",
     out_dir: "出力フォルダ",
-    format: "出力形式",
+    format: "ファイル形式",
+    layout: "データ形状",
+    layout_resample: "等間隔サンプリング(前値ホールド)",
+    layout_raw: "フレーム単位(生データ)",
+    interval_suffix: " ms",
+    timestamp: "時刻列",
+    ts_relative: "先頭からの経過秒",
+    ts_epoch: "UNIX エポック秒",
     browse: "選択...",
     convert: "変換",
     converting: "変換中...",
+    frames_unit: "フレーム",
+    open_folder: "出力フォルダを開く",
+    drop_hint: "ヒント: BLF / DBC ファイルはウィンドウへのドラッグ&ドロップでも指定できます",
     done: |s| {
         format!(
-            "完了: {}\nデコード {} / {} フレーム, 信号列 {}",
+            "変換が完了しました\n出力: {}\n{} 行を書き出し(デコード {} / {} フレーム、信号 {} 列)",
             s.output_path.display(),
+            s.rows_written,
             s.frames_decoded,
             s.frames_read,
             s.signal_columns
@@ -109,17 +144,30 @@ const JA: Labels = Labels {
 };
 
 const EN: Labels = Labels {
+    section_input: "Input",
+    section_output: "Output",
     blf_file: "BLF file",
     dbc_file: "DBC file",
     out_dir: "Output folder",
-    format: "Output format",
+    format: "File format",
+    layout: "Table shape",
+    layout_resample: "Fixed interval (sample & hold)",
+    layout_raw: "Per frame (raw)",
+    interval_suffix: " ms",
+    timestamp: "Timestamp",
+    ts_relative: "Seconds from start",
+    ts_epoch: "Unix epoch seconds",
     browse: "Browse...",
     convert: "Convert",
     converting: "Converting...",
+    frames_unit: "frames",
+    open_folder: "Open output folder",
+    drop_hint: "Tip: you can also drag & drop BLF / DBC files onto this window",
     done: |s| {
         format!(
-            "Done: {}\nDecoded {} of {} frames, {} signal columns",
+            "Conversion finished\nOutput: {}\n{} rows written (decoded {} of {} frames, {} signal columns)",
             s.output_path.display(),
+            s.rows_written,
             s.frames_decoded,
             s.frames_read,
             s.signal_columns
@@ -150,6 +198,9 @@ struct App {
     dbc_path: Option<PathBuf>,
     out_dir: Option<PathBuf>,
     format: OutputFormat,
+    layout: OutputLayout,
+    interval_ms: f64,
+    timestamp: TimestampMode,
     state: State,
 }
 
@@ -161,6 +212,9 @@ impl App {
             dbc_path: None,
             out_dir: None,
             format: OutputFormat::Csv,
+            layout: OutputLayout::Resampled,
+            interval_ms: 100.0,
+            timestamp: TimestampMode::RelativeSeconds,
             state: State::Idle,
         }
     }
@@ -173,14 +227,19 @@ impl App {
         ) else {
             return;
         };
-        let format = self.format;
+        let options = ConvertOptions {
+            format: self.format,
+            layout: self.layout,
+            resample_ms: self.interval_ms,
+            timestamp: self.timestamp,
+        };
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut on_progress = |p: Progress| {
                 let _ = tx.send(WorkerMsg::Progress(p));
             };
             let result =
-                convert(&blf, &dbc, &out, format, &mut on_progress).map_err(|e| format!("{e:#}"));
+                convert(&blf, &dbc, &out, options, &mut on_progress).map_err(|e| format!("{e:#}"));
             let _ = tx.send(WorkerMsg::Finished(result));
         });
         self.state = State::Running {
@@ -207,6 +266,30 @@ impl App {
         }
     }
 
+    /// Assign files dropped onto the window by extension.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("blf") => self.blf_path = Some(path),
+                Some("dbc") => self.dbc_path = Some(path),
+                _ if path.is_dir() => self.out_dir = Some(path),
+                _ => {}
+            }
+        }
+    }
+
     fn path_row(
         ui: &mut egui::Ui,
         label: &str,
@@ -217,11 +300,19 @@ impl App {
         pick: impl Fn() -> Option<PathBuf>,
     ) {
         ui.label(label);
-        let text = path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| not_selected.to_string());
-        ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+        match path {
+            Some(p) => {
+                let file = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                ui.add(egui::Label::new(egui::RichText::new(file).strong()).truncate())
+                    .on_hover_text(p.display().to_string());
+            }
+            None => {
+                ui.add(egui::Label::new(egui::RichText::new(not_selected).weak()).truncate());
+            }
+        }
         if ui.add_enabled(enabled, egui::Button::new(browse)).clicked()
             && let Some(picked) = pick()
         {
@@ -234,6 +325,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.handle_dropped_files(&ui.ctx().clone());
         let labels = self.labels;
         let running = matches!(self.state, State::Running { .. });
         if running {
@@ -241,72 +333,148 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-
-            egui::Grid::new("inputs")
-                .num_columns(3)
-                .spacing([10.0, 8.0])
-                .show(ui, |ui| {
-                    Self::path_row(
-                        ui,
-                        labels.blf_file,
-                        labels.browse,
-                        labels.not_selected,
-                        &mut self.blf_path,
-                        !running,
-                        || {
-                            rfd::FileDialog::new()
-                                .add_filter("BLF", &["blf"])
-                                .pick_file()
-                        },
-                    );
-                    Self::path_row(
-                        ui,
-                        labels.dbc_file,
-                        labels.browse,
-                        labels.not_selected,
-                        &mut self.dbc_path,
-                        !running,
-                        || {
-                            rfd::FileDialog::new()
-                                .add_filter("DBC", &["dbc"])
-                                .pick_file()
-                        },
-                    );
-                    Self::path_row(
-                        ui,
-                        labels.out_dir,
-                        labels.browse,
-                        labels.not_selected,
-                        &mut self.out_dir,
-                        !running,
-                        || rfd::FileDialog::new().pick_folder(),
-                    );
-                });
-
             ui.horizontal(|ui| {
-                ui.label(labels.format);
-                ui.add_enabled_ui(!running, |ui| {
-                    ui.radio_value(&mut self.format, OutputFormat::Csv, "CSV");
-                    ui.radio_value(&mut self.format, OutputFormat::Parquet, "Parquet");
+                ui.heading("BLF Decoder");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("v{APP_VERSION}")).weak());
                 });
             });
+            ui.label(egui::RichText::new(labels.drop_hint).weak().small());
+            ui.add_space(4.0);
 
-            ui.separator();
+            // ---- Input files ----
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(labels.section_input).strong());
+                egui::Grid::new("inputs")
+                    .num_columns(3)
+                    .spacing([12.0, 8.0])
+                    .min_col_width(90.0)
+                    .show(ui, |ui| {
+                        Self::path_row(
+                            ui,
+                            labels.blf_file,
+                            labels.browse,
+                            labels.not_selected,
+                            &mut self.blf_path,
+                            !running,
+                            || {
+                                rfd::FileDialog::new()
+                                    .add_filter("BLF", &["blf"])
+                                    .pick_file()
+                            },
+                        );
+                        Self::path_row(
+                            ui,
+                            labels.dbc_file,
+                            labels.browse,
+                            labels.not_selected,
+                            &mut self.dbc_path,
+                            !running,
+                            || {
+                                rfd::FileDialog::new()
+                                    .add_filter("DBC", &["dbc"])
+                                    .pick_file()
+                            },
+                        );
+                    });
+            });
 
+            // ---- Output settings ----
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(labels.section_output).strong());
+                egui::Grid::new("outputs")
+                    .num_columns(3)
+                    .spacing([12.0, 8.0])
+                    .min_col_width(90.0)
+                    .show(ui, |ui| {
+                        Self::path_row(
+                            ui,
+                            labels.out_dir,
+                            labels.browse,
+                            labels.not_selected,
+                            &mut self.out_dir,
+                            !running,
+                            || rfd::FileDialog::new().pick_folder(),
+                        );
+
+                        ui.label(labels.format);
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.radio_value(&mut self.format, OutputFormat::Csv, "CSV");
+                                ui.radio_value(&mut self.format, OutputFormat::Parquet, "Parquet");
+                            });
+                        });
+                        ui.label("");
+                        ui.end_row();
+
+                        ui.label(labels.layout);
+                        ui.vertical(|ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.layout,
+                                        OutputLayout::Resampled,
+                                        labels.layout_resample,
+                                    );
+                                    ui.add_enabled(
+                                        self.layout == OutputLayout::Resampled,
+                                        egui::DragValue::new(&mut self.interval_ms)
+                                            .range(1.0..=60_000.0)
+                                            .speed(10)
+                                            .suffix(labels.interval_suffix),
+                                    );
+                                });
+                                ui.radio_value(
+                                    &mut self.layout,
+                                    OutputLayout::PerFrame,
+                                    labels.layout_raw,
+                                );
+                            });
+                        });
+                        ui.label("");
+                        ui.end_row();
+
+                        ui.label(labels.timestamp);
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.radio_value(
+                                    &mut self.timestamp,
+                                    TimestampMode::RelativeSeconds,
+                                    labels.ts_relative,
+                                );
+                                ui.radio_value(
+                                    &mut self.timestamp,
+                                    TimestampMode::EpochSeconds,
+                                    labels.ts_epoch,
+                                );
+                            });
+                        });
+                        ui.label("");
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(4.0);
+
+            // ---- Run ----
             let ready = self.blf_path.is_some()
                 && self.dbc_path.is_some()
                 && self.out_dir.is_some()
                 && !running;
-            if ui
-                .add_enabled(
-                    ready,
-                    egui::Button::new(labels.convert).min_size([120.0, 32.0].into()),
-                )
-                .clicked()
-            {
-                self.start_conversion();
-            }
+            ui.vertical_centered_justified(|ui| {
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(egui::RichText::new(labels.convert).size(16.0))
+                            .min_size([0.0, 36.0].into()),
+                    )
+                    .clicked()
+                {
+                    self.start_conversion();
+                }
+            });
 
             match &self.state {
                 State::Idle => {}
@@ -317,20 +485,39 @@ impl eframe::App for App {
                             .animate(true),
                     );
                     ui.label(format!(
-                        "{} {} frames",
-                        labels.converting, progress.frames_read
+                        "{} {} {}",
+                        labels.converting, progress.frames_read, labels.frames_unit
                     ));
                 }
                 State::Done(summary) => {
-                    ui.colored_label(egui::Color32::DARK_GREEN, (labels.done)(summary));
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
+                        (labels.done)(summary),
+                    );
+                    if let Some(dir) = summary.output_path.parent()
+                        && ui.button(labels.open_folder).clicked()
+                    {
+                        open_in_file_manager(dir);
+                    }
                 }
                 State::Failed(message) => {
                     ui.colored_label(
-                        egui::Color32::RED,
+                        egui::Color32::from_rgb(0xc6, 0x28, 0x28),
                         format!("{}{}", labels.error_prefix, message),
                     );
                 }
             }
         });
     }
+}
+
+/// Open a folder in the platform file manager (best effort).
+fn open_in_file_manager(dir: &Path) {
+    #[cfg(target_os = "windows")]
+    let command = "explorer";
+    #[cfg(target_os = "macos")]
+    let command = "open";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let command = "xdg-open";
+    let _ = std::process::Command::new(command).arg(dir).spawn();
 }

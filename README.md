@@ -28,14 +28,28 @@ BLF(Vector Binary Logging Format)と DBC ファイルを入力し、CAN 信号�
 
 ## 出力データ形式
 
-1 行が 1 CAN フレームに対応します。
+1 列目が `Timestamp`、2 列目以降が DBC で定義された Signal 名(例: `EngineSpeed`, `VehicleSpeed`)です。信号名が複数メッセージで重複する場合は `メッセージ名.信号名` の形式で区別されます。
 
-| 列 | 内容 |
+**データ形状**(選択可):
+
+| 形状 | 内容 |
 |---|---|
-| `Timestamp` | UNIX エポック秒(BLF ヘッダの計測開始時刻 + フレームのオフセット) |
-| 2 列目以降 | DBC で定義された Signal 名(例: `EngineSpeed`, `VehicleSpeed`)。そのフレームに含まれない信号は空欄(CSV)/ null(Parquet) |
+| 等間隔サンプリング(デフォルト) | 指定間隔(デフォルト 100 ms)のグリッドに前値ホールド(サンプル&ホールド)で整列。すべての行に全信号の最新値が入った、そのまま分析に使えるテーブルになります |
+| フレーム単位(生データ) | 1 行 = 1 CAN フレーム。そのフレームに含まれない信号は空欄(CSV)/ null(Parquet) |
 
-信号名が複数メッセージで重複する場合は `メッセージ名.信号名` の形式で区別されます。
+**時刻列**(選択可):
+
+| モード | 内容 |
+|---|---|
+| 先頭からの経過秒(デフォルト) | `0.0, 0.1, 0.2, ...` のような相対秒 |
+| UNIX エポック秒 | BLF ヘッダの計測開始時刻 + フレームのオフセット |
+
+```
+Timestamp,EngineSpeed,EngineTemp,VehicleSpeed   ← 等間隔サンプリング(100 ms)の例
+0.0,800.0,10.0,
+0.1,1135.5,11.0,40.5
+0.2,1389.0,12.0,41.5
+```
 
 ## 使い方
 
@@ -43,19 +57,22 @@ BLF(Vector Binary Logging Format)と DBC ファイルを入力し、CAN 信号�
 
 実行ファイルをダブルクリック(または引数なしで起動)すると GUI が開きます。
 
-1. BLF ファイルを選択
-2. DBC ファイルを選択
+1. BLF ファイルを選択(ウィンドウへのドラッグ&ドロップでも可)
+2. DBC ファイルを選択(同上)
 3. 出力フォルダを選択
-4. 出力形式(CSV / Parquet)を選択
+4. ファイル形式(CSV / Parquet)、データ形状、時刻列を選択
 5. 「変換」ボタンを押す
 
-出力ファイル名は `<BLFファイル名>.csv` / `<BLFファイル名>.parquet` になります。
+出力ファイル名は `<BLFファイル名>.csv` / `<BLFファイル名>.parquet` になります。変換完了後に「出力フォルダを開く」ボタンで結果をすぐ確認できます。
 
 ### CLI(開発・自動化用)
 
 ```
-blf_decoder --blf input.blf --dbc database.dbc --out ./output --format csv
-blf_decoder --blf input.blf --dbc database.dbc --out ./output --format parquet
+blf_decoder --blf input.blf --dbc database.dbc --out ./output
+    [--format csv|parquet]       出力形式(デフォルト: csv)
+    [--layout resample|raw]      データ形状(デフォルト: resample)
+    [--interval-ms <n>]          サンプリング間隔(デフォルト: 100)
+    [--timestamp relative|epoch] 時刻列(デフォルト: relative)
 ```
 
 ## ビルド
@@ -89,6 +106,9 @@ DBC Parser (src/dbc.rs)          … BO_ / SG_ / SIG_VALTYPE_ の解析
 CAN Signal Decoder (src/decode.rs) … ビット抽出 + 物理値変換、列レイアウト決定
  │
  ▼
+Row Shaper (src/shape.rs)          … 等間隔リサンプリング(前値ホールド)
+ │
+ ▼
 Conversion Pipeline (src/convert.rs)
  │
  ├── CSV Exporter (src/export/csv.rs)
@@ -97,8 +117,8 @@ Conversion Pipeline (src/convert.rs)
 
 コア処理はライブラリ(`blf_decoder` クレート)として分離されており、GUI / CLI のどちらからも同じパイプラインを呼び出します。信号選択・時間範囲フィルタ・複数 BLF 一括変換などの将来拡張は `convert.rs` への追加で対応できる構成です。
 
-## 制限事項(v0.1)
+## 制限事項
 
 - BLF 内の CAN 以外のオブジェクト(LIN, FlexRay, イベント等)はスキップされます
 - DBC の拡張マルチプレクサ定義(SG_MUL_VAL_)は単純な m\<N\> として扱われます
-- 出力タイムスタンプは f64 のエポック秒です(サブマイクロ秒精度が必要な場合は将来拡張で対応予定)
+- 等間隔サンプリングはフレームが概ね時刻順で記録されていることを前提とします(通常のロガー出力は時刻順です)
