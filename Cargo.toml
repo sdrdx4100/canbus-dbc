@@ -1,6 +1,6 @@
 [package]
 name = "blf_decoder"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Decode Vector BLF CAN logs with a DBC file and export CSV/Parquet"
 license = "MIT"

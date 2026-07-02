@@ -40,7 +40,7 @@ impl Default for JobDefaults {
             keep_can_id: false,
             skip_unknown: true,
             overwrite: false,
-            drop_empty: false,
+            drop_empty: true,
         }
     }
 }

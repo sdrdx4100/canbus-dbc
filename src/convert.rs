@@ -110,6 +110,8 @@ pub struct Summary {
     /// Rows written to the output file.
     pub rows_written: u64,
     pub signal_columns: usize,
+    /// Columns removed by `drop_empty_columns` (signals with no data).
+    pub dropped_empty_columns: usize,
 }
 
 /// Derive the output file path: `<out_dir>/<blf stem>.<ext>`.
@@ -195,6 +197,7 @@ pub fn convert(
 
     // Optional pre-scan: narrow the columns down to signals that actually
     // carry data somewhere in this BLF.
+    let mut dropped_empty_columns = 0usize;
     if options.drop_empty_columns {
         let observed = scan_observed_columns(blf_path, &decoder, progress)?;
         let kept: HashSet<String> = decoder
@@ -207,7 +210,8 @@ pub fn convert(
         if kept.is_empty() {
             bail!("no signals with data found in this BLF");
         }
-        if kept.len() < decoder.columns().len() {
+        dropped_empty_columns = decoder.columns().len() - kept.len();
+        if dropped_empty_columns > 0 {
             decoder = Decoder::with_filter(&dbc, Some(&kept));
         }
     }
@@ -326,5 +330,6 @@ pub fn convert(
         frames_decoded: state.frames_decoded,
         rows_written,
         signal_columns: decoder.columns().len(),
+        dropped_empty_columns,
     })
 }

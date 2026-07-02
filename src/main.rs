@@ -91,8 +91,13 @@ fn run_cli(args: &[String]) -> Result<()> {
     };
     let summary = convert(&blf, &dbc, &out, options, &mut on_progress)?;
     eprintln!();
+    let dropped = if summary.dropped_empty_columns > 0 {
+        format!(", {} empty columns dropped", summary.dropped_empty_columns)
+    } else {
+        String::new()
+    };
     println!(
-        "Done: {} ({} rows, {} of {} frames decoded, {} signal columns)",
+        "Done: {} ({} rows, {} of {} frames decoded, {} signal columns{dropped})",
         summary.output_path.display(),
         summary.rows_written,
         summary.frames_decoded,

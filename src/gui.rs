@@ -217,13 +217,26 @@ const JA: Labels = Labels {
     elapsed: "経過",
     remaining: "残り",
     done_summary: |s| {
-        format!(
+        let mut text = format!(
             "{} 行を書き出しました (デコード {} / {} フレーム、信号 {} 列)",
             s.rows_written, s.frames_decoded, s.frames_read, s.signal_columns
-        )
+        );
+        if s.dropped_empty_columns > 0 {
+            text.push_str(&format!(
+                "、データのない {} 列を除外",
+                s.dropped_empty_columns
+            ));
+        }
+        text
     },
     log_loading: |f| format!("{f} を読み込み中..."),
-    log_done: |f, s| format!("{f} → {} ({} 行)", s.output_path.display(), s.rows_written),
+    log_done: |f, s| {
+        let mut text = format!("{f} → {} ({} 行)", s.output_path.display(), s.rows_written);
+        if s.dropped_empty_columns > 0 {
+            text.push_str(&format!("、空列 {} 列を除外", s.dropped_empty_columns));
+        }
+        text
+    },
     log_error: |f, e| format!("{f} でエラー: {e}"),
     log_queue_done: "キューの処理が完了しました。",
     drop_hint: "BLF / DBC / フォルダをドロップで追加",
@@ -285,10 +298,17 @@ const EN: Labels = Labels {
     elapsed: "Elapsed",
     remaining: "Remaining",
     done_summary: |s| {
-        format!(
+        let mut text = format!(
             "{} rows written (decoded {} / {} frames, {} signal columns)",
             s.rows_written, s.frames_decoded, s.frames_read, s.signal_columns
-        )
+        );
+        if s.dropped_empty_columns > 0 {
+            text.push_str(&format!(
+                ", {} empty columns dropped",
+                s.dropped_empty_columns
+            ));
+        }
+        text
     },
     log_loading: |f| format!("Reading {f}..."),
     log_done: |f, s| {
