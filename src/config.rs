@@ -27,6 +27,7 @@ pub struct JobDefaults {
     pub keep_can_id: bool,
     pub skip_unknown: bool,
     pub overwrite: bool,
+    pub drop_empty: bool,
 }
 
 impl Default for JobDefaults {
@@ -39,6 +40,7 @@ impl Default for JobDefaults {
             keep_can_id: false,
             skip_unknown: true,
             overwrite: false,
+            drop_empty: false,
         }
     }
 }

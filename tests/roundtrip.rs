@@ -70,6 +70,17 @@ BO_ 512 Vehicle: 8 ECU
  SG_ VehicleSpeed : 7|16@0+ (0.01,0) [0|655.35] "km/h" Vector__XXX
 "#;
 
+/// Like DBC but with a message (0x600) that never appears in the log.
+const DBC_WITH_GHOST: &str = r#"
+BO_ 256 Engine: 8 ECU
+ SG_ EngineSpeed : 0|16@1+ (0.125,0) [0|8000] "rpm" Vector__XXX
+ SG_ EngineTemp : 16|8@1- (1,-40) [-40|215] "degC" Vector__XXX
+BO_ 1536 Ghost: 8 ECU
+ SG_ GhostSignal : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+BO_ 512 Vehicle: 8 ECU
+ SG_ VehicleSpeed : 7|16@0+ (0.01,0) [0|655.35] "km/h" Vector__XXX
+"#;
+
 struct Fixture {
     dir: PathBuf,
     blf: PathBuf,
@@ -304,6 +315,64 @@ fn signal_filter_limits_output_columns() {
         text.lines().next().unwrap(),
         "Timestamp,EngineSpeed,VehicleSpeed"
     );
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn drop_empty_columns_excludes_dataless_signals() {
+    let fx = setup("dropempty");
+    std::fs::write(&fx.dbc, DBC_WITH_GHOST).unwrap();
+
+    // Off: GhostSignal appears as an (always empty) column.
+    let summary = convert(
+        &fx.blf,
+        &fx.dbc,
+        &fx.dir,
+        raw_epoch(OutputFormat::Csv),
+        &mut |_| {},
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    assert_eq!(
+        text.lines().next().unwrap(),
+        "Timestamp,EngineSpeed,EngineTemp,GhostSignal,VehicleSpeed"
+    );
+
+    // On: GhostSignal is dropped, data columns are untouched.
+    let options = ConvertOptions {
+        drop_empty_columns: true,
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let mut saw_scan = false;
+    let summary = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |u| {
+        saw_scan |= u.scanning;
+    })
+    .unwrap();
+    assert_eq!(summary.signal_columns, 3);
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Timestamp,EngineSpeed,EngineTemp,VehicleSpeed");
+    let row1: Vec<&str> = lines[1].split(',').collect();
+    assert_eq!(row1[1].parse::<f64>().unwrap(), 836.0);
+    let row2: Vec<&str> = lines[2].split(',').collect();
+    assert!((row2[3].parse::<f64>().unwrap() - 60.0).abs() < 1e-9);
+    let _ = saw_scan; // scan pass may finish early before the first tick
+
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn drop_empty_columns_errors_when_nothing_has_data() {
+    let fx = setup("dropempty_all");
+    std::fs::write(&fx.dbc, DBC_WITH_GHOST).unwrap();
+    // Select only the ghost signal, then ask to drop empty columns.
+    let options = ConvertOptions {
+        drop_empty_columns: true,
+        signal_filter: Some(["GhostSignal".to_string()].into_iter().collect()),
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let err = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("no signals with data"), "{err}");
     std::fs::remove_dir_all(&fx.dir).ok();
 }
 

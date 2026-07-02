@@ -67,7 +67,7 @@ Timestamp,EngineSpeed,EngineTemp,VehicleSpeed   ← 等間隔サンプリング(
 - 下部: 進捗(ファイル / フレーム数 / 現在のメッセージ / 経過・残り時間)と折りたたみ式ログ
 - テーマ: システム / ダーク / ライト。最近使った DBC・出力先や既定設定は自動保存されます
 
-オプション: 相対時刻、CanId 列の出力、検索付きの信号選択、DBC にない CAN ID のスキップ(オフでエラー検出)、既存ファイルの上書き制御。
+オプション: 相対時刻、CanId 列の出力、検索付きの信号選択、DBC にない CAN ID のスキップ(オフでエラー検出)、既存ファイルの上書き制御、**データのない信号列の除外**(事前スキャンで実データのある信号だけを列に採用)。
 
 出力ファイル名は `<BLFファイル名>.csv` / `<BLFファイル名>.parquet` になります。
 
@@ -79,6 +79,7 @@ blf_decoder --blf input.blf --dbc database.dbc --out ./output
     [--layout resample|raw]      データ形状(デフォルト: resample)
     [--interval-ms <n>]          サンプリング間隔(デフォルト: 100)
     [--timestamp relative|epoch] 時刻列(デフォルト: relative)
+    [--drop-empty]               データのない信号列を除外
 ```
 
 ## ビルド

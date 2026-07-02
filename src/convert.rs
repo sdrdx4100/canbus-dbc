@@ -52,6 +52,9 @@ pub struct ConvertOptions {
     /// Restrict the output to these column names (see `decode::list_columns`).
     /// `None` exports every signal in the DBC.
     pub signal_filter: Option<HashSet<String>>,
+    /// Drop columns for signals that never carry a value in this BLF.
+    /// Requires an extra scan pass over the input file.
+    pub drop_empty_columns: bool,
 }
 
 impl Default for ConvertOptions {
@@ -65,6 +68,7 @@ impl Default for ConvertOptions {
             skip_unknown_ids: true,
             overwrite: true,
             signal_filter: None,
+            drop_empty_columns: false,
         }
     }
 }
@@ -93,6 +97,8 @@ pub struct ProgressUpdate<'a> {
     pub progress: Progress,
     /// DBC name of the most recently decoded message, when known.
     pub current_message: Option<&'a str>,
+    /// True during the pre-scan pass used by `drop_empty_columns`.
+    pub scanning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +119,52 @@ pub fn output_path(blf_path: &Path, out_dir: &Path, format: OutputFormat) -> Pat
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "output".to_string());
     out_dir.join(format!("{stem}.{}", format.extension()))
+}
+
+/// Pre-scan pass for `drop_empty_columns`: decode every frame and record
+/// which columns receive at least one value.
+fn scan_observed_columns(
+    blf_path: &Path,
+    decoder: &Decoder,
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+) -> Result<Vec<bool>> {
+    let file = File::open(blf_path)
+        .with_context(|| format!("failed to open BLF file {}", blf_path.display()))?;
+    let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BlfReader::new(BufReader::with_capacity(1 << 20, file))?;
+
+    let mut observed = vec![false; decoder.columns().len()];
+    let mut remaining = observed.len();
+    let mut state = Progress {
+        total_bytes,
+        ..Default::default()
+    };
+    let mut cells: Vec<(usize, f64)> = Vec::new();
+    while let Some(frame) = reader.next_frame()? {
+        state.frames_read += 1;
+        if decoder.decode(&frame, &mut cells) {
+            state.frames_decoded += 1;
+            for &(col, _) in &cells {
+                if !observed[col] {
+                    observed[col] = true;
+                    remaining -= 1;
+                }
+            }
+            // Every column seen: no need to read the rest of the file.
+            if remaining == 0 {
+                break;
+            }
+        }
+        if state.frames_read.is_multiple_of(4096) {
+            state.bytes_read = reader.bytes_read();
+            progress(ProgressUpdate {
+                progress: state,
+                current_message: None,
+                scanning: true,
+            });
+        }
+    }
+    Ok(observed)
 }
 
 /// Run the full conversion. `progress` is invoked periodically (every few
@@ -136,9 +188,28 @@ pub fn convert(
             dbc_path.display()
         );
     }
-    let decoder = Decoder::with_filter(&dbc, options.signal_filter.as_ref());
+    let mut decoder = Decoder::with_filter(&dbc, options.signal_filter.as_ref());
     if decoder.columns().is_empty() {
         bail!("no signals selected for export");
+    }
+
+    // Optional pre-scan: narrow the columns down to signals that actually
+    // carry data somewhere in this BLF.
+    if options.drop_empty_columns {
+        let observed = scan_observed_columns(blf_path, &decoder, progress)?;
+        let kept: HashSet<String> = decoder
+            .columns()
+            .iter()
+            .zip(&observed)
+            .filter(|(_, seen)| **seen)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if kept.is_empty() {
+            bail!("no signals with data found in this BLF");
+        }
+        if kept.len() < decoder.columns().len() {
+            decoder = Decoder::with_filter(&dbc, Some(&kept));
+        }
     }
 
     let file = File::open(blf_path)
@@ -231,6 +302,7 @@ pub fn convert(
                 current_message: last_frame_for_name
                     .as_ref()
                     .and_then(|f| decoder.message_name(f)),
+                scanning: false,
             });
         }
     }
@@ -245,6 +317,7 @@ pub fn convert(
     progress(ProgressUpdate {
         progress: state,
         current_message: None,
+        scanning: false,
     });
 
     Ok(Summary {

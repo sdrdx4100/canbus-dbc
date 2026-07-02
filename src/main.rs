@@ -22,6 +22,7 @@ const USAGE: &str = "Usage: blf_decoder --blf <file.blf> --dbc <file.dbc> --out 
        [--layout resample|raw]     table shape            (default: resample)
        [--interval-ms <n>]         resample grid spacing  (default: 100)
        [--timestamp relative|epoch] Timestamp column      (default: relative)
+       [--drop-empty]              exclude signals that never carry data
 Run without arguments to start the GUI.";
 
 /// Minimal CLI (development aid / future extension per the requirements).
@@ -65,6 +66,7 @@ fn run_cli(args: &[String]) -> Result<()> {
                     other => bail!("unknown timestamp mode {other:?}\n{USAGE}"),
                 }
             }
+            "--drop-empty" => options.drop_empty_columns = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());

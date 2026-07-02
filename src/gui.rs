@@ -121,6 +121,8 @@ struct Labels {
     only_selected: &'static str,
     skip_unknown: &'static str,
     overwrite: &'static str,
+    drop_empty: &'static str,
+    scanning: &'static str,
     advanced: &'static str,
     layout_resample: &'static str,
     layout_raw: &'static str,
@@ -182,6 +184,8 @@ const JA: Labels = Labels {
     only_selected: "選択した信号のみ出力",
     skip_unknown: "DBC にない CAN ID をスキップ",
     overwrite: "既存ファイルを上書き",
+    drop_empty: "データのない信号列を除外",
+    scanning: "スキャン中 (データのある信号を検出)...",
     advanced: "詳細設定",
     layout_resample: "等間隔サンプリング",
     layout_raw: "フレーム単位 (生データ)",
@@ -248,6 +252,8 @@ const EN: Labels = Labels {
     only_selected: "Export only selected signals",
     skip_unknown: "Skip unknown CAN IDs",
     overwrite: "Overwrite existing files",
+    drop_empty: "Exclude signals with no data",
+    scanning: "Scanning (detecting signals with data)...",
     advanced: "Advanced",
     layout_resample: "Fixed-interval sampling",
     layout_raw: "Per frame (raw)",
@@ -323,6 +329,7 @@ struct Job {
     keep_can_id: bool,
     skip_unknown: bool,
     overwrite: bool,
+    drop_empty: bool,
     only_selected: bool,
     selected_signals: HashSet<String>,
     state: JobState,
@@ -357,6 +364,7 @@ impl Job {
             keep_can_id: self.keep_can_id,
             skip_unknown_ids: self.skip_unknown,
             overwrite: self.overwrite,
+            drop_empty_columns: self.drop_empty,
             signal_filter: if self.only_selected {
                 Some(self.selected_signals.clone())
             } else {
@@ -376,6 +384,7 @@ enum WorkerEvent {
         job_id: u64,
         progress: Progress,
         message: Option<String>,
+        scanning: bool,
     },
     Finished {
         job_id: u64,
@@ -399,6 +408,7 @@ struct RunState {
     queue_total: usize,
     progress: Progress,
     current_message: Option<String>,
+    scanning: bool,
     job_started: Instant,
 }
 
@@ -416,6 +426,7 @@ fn spawn_worker(specs: Vec<RunSpec>, tx: Sender<WorkerEvent>) {
                     job_id: spec.job_id,
                     progress: u.progress,
                     message: u.current_message.map(|s| s.to_string()),
+                    scanning: u.scanning,
                 });
             };
             let result = convert(
@@ -574,6 +585,7 @@ impl App {
             keep_can_id: d.keep_can_id,
             skip_unknown: d.skip_unknown,
             overwrite: d.overwrite,
+            drop_empty: d.drop_empty,
             only_selected: false,
             selected_signals: HashSet::new(),
             state: JobState::Ready,
@@ -665,6 +677,7 @@ impl App {
             queue_total: total,
             progress: Progress::default(),
             current_message: None,
+            scanning: false,
             job_started: Instant::now(),
         });
     }
@@ -686,6 +699,7 @@ impl App {
                     run.queue_total = total;
                     run.progress = Progress::default();
                     run.current_message = None;
+                    run.scanning = false;
                     run.job_started = Instant::now();
                     if let Some(job) = self.jobs.iter().find(|j| j.id == job_id) {
                         self.log.push((labels.log_loading)(&job.file_name()));
@@ -695,9 +709,11 @@ impl App {
                     job_id,
                     progress,
                     message,
+                    scanning,
                 } => {
                     if run.current_job == Some(job_id) {
                         run.progress = progress;
+                        run.scanning = scanning;
                         if message.is_some() {
                             run.current_message = message;
                         }
@@ -1094,6 +1110,7 @@ impl App {
                 });
                 ui.checkbox(&mut job.skip_unknown, labels.skip_unknown);
                 ui.checkbox(&mut job.overwrite, labels.overwrite);
+                ui.checkbox(&mut job.drop_empty, labels.drop_empty);
                 ui.checkbox(&mut job.only_selected, labels.only_selected);
 
                 egui::CollapsingHeader::new(labels.advanced)
@@ -1144,7 +1161,7 @@ impl App {
         let Some(source) = self.job(source_id) else {
             return;
         };
-        let (fp, lr, im, rt, kc, su, ow, os, sel, dbc) = (
+        let (fp, lr, im, rt, kc, su, ow, de, os, sel, dbc) = (
             source.format_parquet,
             source.layout_raw,
             source.interval_ms,
@@ -1152,6 +1169,7 @@ impl App {
             source.keep_can_id,
             source.skip_unknown,
             source.overwrite,
+            source.drop_empty,
             source.only_selected,
             source.selected_signals.clone(),
             source.dbc.clone(),
@@ -1168,6 +1186,7 @@ impl App {
             job.keep_can_id = kc;
             job.skip_unknown = su;
             job.overwrite = ow;
+            job.drop_empty = de;
             job.only_selected = os;
             job.selected_signals = sel.clone();
             job.out_dir = out_dir.clone();
@@ -1290,11 +1309,16 @@ impl App {
                 .and_then(|id| self.job(id))
                 .map(|j| j.file_name())
                 .unwrap_or_default();
-            ui.label((labels.progress_of)(
-                run.queue_index + 1,
-                run.queue_total,
-                &file,
-            ));
+            ui.horizontal(|ui| {
+                ui.label((labels.progress_of)(
+                    run.queue_index + 1,
+                    run.queue_total,
+                    &file,
+                ));
+                if run.scanning {
+                    ui.label(egui::RichText::new(labels.scanning).weak());
+                }
+            });
             ui.add(
                 egui::ProgressBar::new(run.progress.fraction())
                     .show_percentage()
@@ -1391,6 +1415,7 @@ impl App {
                     .checkbox(&mut d.skip_unknown, labels.skip_unknown)
                     .changed();
                 changed |= ui.checkbox(&mut d.overwrite, labels.overwrite).changed();
+                changed |= ui.checkbox(&mut d.drop_empty, labels.drop_empty).changed();
             });
         if changed {
             self.config.save();
