@@ -1,6 +1,17 @@
 # BLF Decoder
 
+<img src="assets/icon-256.png" width="96" align="right" alt="BLF Decoder icon">
+
 BLF(Vector Binary Logging Format)と DBC ファイルを入力し、CAN 信号をデコードして CSV / Parquet に出力するデスクトップアプリケーションです。Python 環境や CAN 解析ソフトを必要とせず、単一の実行ファイルで動作します。
+
+## ダウンロード
+
+[Releases](../../releases) ページから最新の実行ファイルを取得できます。
+
+- `blf_decoder-vX.Y.Z-windows-x64.exe` — Windows 用(そのまま実行できます)
+- `blf_decoder-vX.Y.Z-linux-x64` — Linux 用
+
+リリースはタグ(`v*`)の push をトリガーに GitHub Actions が自動でビルド・公開します。
 
 ## 機能
 
@@ -60,6 +71,8 @@ cargo build --release
 ```
 cargo test        # ユニット + 統合テスト
 ```
+
+アイコンは `scripts/gen_icon.py`(要 Pillow)で生成し、`build.rs`(winresource)で exe に埋め込んでいます。
 
 ## モジュール構成
 
