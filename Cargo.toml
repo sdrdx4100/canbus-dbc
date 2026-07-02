@@ -1,6 +1,6 @@
 [package]
 name = "blf_decoder"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Decode Vector BLF CAN logs with a DBC file and export CSV/Parquet"
 license = "MIT"
@@ -12,6 +12,8 @@ flate2 = "1.1"
 parquet = { version = "59.0", default-features = false, features = ["snap"] }
 rfd = "0.17"
 ryu = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 
 [build-dependencies]
 winresource = "0.1"

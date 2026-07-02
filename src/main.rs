@@ -1,10 +1,11 @@
 // Hide the console window for the GUI build on Windows release binaries.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod config;
 mod gui;
 
 use anyhow::{Context, Result, bail};
-use blf_decoder::convert::{ConvertOptions, OutputLayout, Progress, TimestampMode, convert};
+use blf_decoder::convert::{ConvertOptions, OutputLayout, ProgressUpdate, TimestampMode, convert};
 use blf_decoder::export::OutputFormat;
 use std::path::PathBuf;
 
@@ -76,10 +77,13 @@ fn run_cli(args: &[String]) -> Result<()> {
     let out = out.with_context(|| format!("missing --out\n{USAGE}"))?;
 
     let mut last_percent = u32::MAX;
-    let mut on_progress = |p: Progress| {
-        let percent = (p.fraction() * 100.0) as u32;
+    let mut on_progress = |u: ProgressUpdate<'_>| {
+        let percent = (u.progress.fraction() * 100.0) as u32;
         if percent != last_percent {
-            eprint!("\rConverting... {percent}% ({} frames)", p.frames_read);
+            eprint!(
+                "\rConverting... {percent}% ({} frames)",
+                u.progress.frames_read
+            );
             last_percent = percent;
         }
     };

@@ -2,11 +2,49 @@
 //!
 //! The decoder also owns the output column layout: one column per DBC signal,
 //! in DBC declaration order. Signal names that collide across messages are
-//! disambiguated as `Message.Signal`.
+//! disambiguated as `Message.Signal`. An optional filter restricts the
+//! columns (and decoding work) to a chosen subset of signals.
 
 use crate::blf::CanFrame;
 use crate::dbc::{ByteOrder, Dbc, MuxRole, SignalDef, ValueType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// One output column as derived from the DBC (before any filtering).
+#[derive(Debug, Clone)]
+pub struct ColumnSpec {
+    /// Column name: the signal name, qualified as `Message.Signal` when the
+    /// signal name appears in more than one message.
+    pub name: String,
+    /// Name of the message the signal belongs to.
+    pub message: String,
+}
+
+/// Column names (with their message) in DBC declaration order. This is what
+/// a UI should present for signal selection; pass the chosen `name`s back via
+/// `Decoder::with_filter`.
+pub fn list_columns(dbc: &Dbc) -> Vec<ColumnSpec> {
+    let mut name_count: HashMap<&str, u32> = HashMap::new();
+    for message in &dbc.messages {
+        for signal in &message.signals {
+            *name_count.entry(signal.name.as_str()).or_default() += 1;
+        }
+    }
+    let mut columns = Vec::new();
+    for message in &dbc.messages {
+        for signal in &message.signals {
+            let name = if name_count[signal.name.as_str()] > 1 {
+                format!("{}.{}", message.name, signal.name)
+            } else {
+                signal.name.clone()
+            };
+            columns.push(ColumnSpec {
+                name,
+                message: message.name.clone(),
+            });
+        }
+    }
+    columns
+}
 
 struct BoundSignal {
     def: SignalDef,
@@ -14,9 +52,11 @@ struct BoundSignal {
 }
 
 struct BoundMessage {
+    name: String,
     signals: Vec<BoundSignal>,
-    /// Index into `signals` of the multiplexor switch, if any.
-    switch: Option<usize>,
+    /// Multiplexor switch definition (kept even when its column is filtered
+    /// out, since multiplexed signals need the switch value).
+    switch: Option<SignalDef>,
 }
 
 pub struct Decoder {
@@ -29,35 +69,36 @@ const EXT_KEY_BIT: u32 = 0x8000_0000;
 
 impl Decoder {
     pub fn new(dbc: &Dbc) -> Self {
-        // Count name occurrences to decide which columns need qualification.
-        let mut name_count: HashMap<&str, u32> = HashMap::new();
-        for message in &dbc.messages {
-            for signal in &message.signals {
-                *name_count.entry(signal.name.as_str()).or_default() += 1;
-            }
-        }
+        Self::with_filter(dbc, None)
+    }
 
-        let mut columns = Vec::new();
+    /// Build a decoder whose output is restricted to the given column names
+    /// (as produced by [`list_columns`]). `None` exports everything.
+    pub fn with_filter(dbc: &Dbc, filter: Option<&HashSet<String>>) -> Self {
+        let specs = list_columns(dbc);
+        let mut spec_iter = specs.into_iter();
+
+        let mut columns: Vec<String> = Vec::new();
         let mut messages = HashMap::new();
         for message in &dbc.messages {
             let mut bound = BoundMessage {
-                signals: Vec::with_capacity(message.signals.len()),
+                name: message.name.clone(),
+                signals: Vec::new(),
                 switch: None,
             };
             for signal in &message.signals {
-                let column_name = if name_count[signal.name.as_str()] > 1 {
-                    format!("{}.{}", message.name, signal.name)
-                } else {
-                    signal.name.clone()
-                };
+                let spec = spec_iter.next().expect("column specs out of sync");
                 if signal.mux == MuxRole::Switch {
-                    bound.switch = Some(bound.signals.len());
+                    bound.switch = Some(signal.clone());
                 }
-                bound.signals.push(BoundSignal {
-                    def: signal.clone(),
-                    column: columns.len(),
-                });
-                columns.push(column_name);
+                let selected = filter.is_none_or(|f| f.contains(&spec.name));
+                if selected {
+                    bound.signals.push(BoundSignal {
+                        def: signal.clone(),
+                        column: columns.len(),
+                    });
+                    columns.push(spec.name);
+                }
             }
             let key = message.id | if message.is_extended { EXT_KEY_BIT } else { 0 };
             messages.insert(key, bound);
@@ -70,22 +111,38 @@ impl Decoder {
         &self.columns
     }
 
+    fn lookup(&self, frame: &CanFrame) -> Option<&BoundMessage> {
+        let key = frame.id | if frame.is_extended { EXT_KEY_BIT } else { 0 };
+        self.messages.get(&key)
+    }
+
+    /// True when the frame's CAN ID is defined in the DBC.
+    pub fn contains_id(&self, frame: &CanFrame) -> bool {
+        self.lookup(frame).is_some()
+    }
+
+    /// DBC message name for the frame's CAN ID, if defined.
+    pub fn message_name(&self, frame: &CanFrame) -> Option<&str> {
+        self.lookup(frame).map(|m| m.name.as_str())
+    }
+
     /// Decode a frame into `out` as `(column index, physical value)` pairs.
-    /// Returns false if the frame's ID is not in the DBC.
+    /// Returns false if the frame's ID is not in the DBC (or it is a remote
+    /// frame carrying no data).
     pub fn decode(&self, frame: &CanFrame, out: &mut Vec<(usize, f64)>) -> bool {
         out.clear();
         if frame.is_remote {
             return false;
         }
-        let key = frame.id | if frame.is_extended { EXT_KEY_BIT } else { 0 };
-        let Some(message) = self.messages.get(&key) else {
+        let Some(message) = self.lookup(frame) else {
             return false;
         };
         let data = frame.data();
 
         let switch_value = message
             .switch
-            .and_then(|i| extract_raw(data, &message.signals[i].def));
+            .as_ref()
+            .and_then(|def| extract_raw(data, def));
 
         for signal in &message.signals {
             match signal.def.mux {
@@ -279,5 +336,44 @@ mod tests {
         let text = "BO_ 1 A: 8 X\n SG_ Speed : 0|8@1+ (1,0) [0|0] \"\" X\nBO_ 2 B: 8 X\n SG_ Speed : 0|8@1+ (1,0) [0|0] \"\" X\n SG_ Unique : 8|8@1+ (1,0) [0|0] \"\" X\n";
         let d = decoder(text);
         assert_eq!(d.columns(), &["A.Speed", "B.Speed", "Unique"]);
+        let specs = list_columns(&Dbc::parse(text).unwrap());
+        assert_eq!(specs[0].message, "A");
+        assert_eq!(specs[2].name, "Unique");
+    }
+
+    #[test]
+    fn signal_filter_restricts_columns() {
+        let text = "BO_ 1 M: 8 X\n SG_ A : 0|8@1+ (1,0) [0|0] \"\" X\n SG_ B : 8|8@1+ (1,0) [0|0] \"\" X\n SG_ C : 16|8@1+ (1,0) [0|0] \"\" X\n";
+        let dbc = Dbc::parse(text).unwrap();
+        let filter: HashSet<String> = ["A", "C"].iter().map(|s| s.to_string()).collect();
+        let d = Decoder::with_filter(&dbc, Some(&filter));
+        assert_eq!(d.columns(), &["A", "C"]);
+        let mut out = Vec::new();
+        assert!(d.decode(&frame(1, false, &[1, 2, 3]), &mut out));
+        assert_eq!(out, vec![(0, 1.0), (1, 3.0)]);
+    }
+
+    #[test]
+    fn filtered_mux_values_still_decode() {
+        // Switch column not selected, but a multiplexed signal is: the switch
+        // must still gate decoding.
+        let text = "BO_ 768 M: 8 X\n SG_ Sw M : 0|4@1+ (1,0) [0|0] \"\" X\n SG_ A m0 : 8|8@1+ (1,0) [0|0] \"\" X\n SG_ B m1 : 8|8@1+ (1,0) [0|0] \"\" X\n";
+        let dbc = Dbc::parse(text).unwrap();
+        let filter: HashSet<String> = ["B"].iter().map(|s| s.to_string()).collect();
+        let d = Decoder::with_filter(&dbc, Some(&filter));
+        assert_eq!(d.columns(), &["B"]);
+        let mut out = Vec::new();
+        d.decode(&frame(768, false, &[0x00, 42]), &mut out);
+        assert!(out.is_empty()); // switch=0 selects A, B not present
+        d.decode(&frame(768, false, &[0x01, 42]), &mut out);
+        assert_eq!(out, vec![(0, 42.0)]);
+    }
+
+    #[test]
+    fn message_name_lookup() {
+        let d = decoder("BO_ 256 Engine: 8 X\n SG_ A : 0|8@1+ (1,0) [0|0] \"\" X\n");
+        assert_eq!(d.message_name(&frame(256, false, &[0])), Some("Engine"));
+        assert_eq!(d.message_name(&frame(257, false, &[0])), None);
+        assert!(d.contains_id(&frame(256, false, &[0])));
     }
 }

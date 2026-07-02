@@ -8,6 +8,7 @@ use crate::export::parquet::ParquetExporter;
 use crate::export::{Exporter, OutputFormat};
 use crate::shape::Resampler;
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -33,13 +34,24 @@ pub enum TimestampMode {
     EpochSeconds,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConvertOptions {
     pub format: OutputFormat,
     pub layout: OutputLayout,
     /// Grid spacing in milliseconds when `layout == Resampled`.
     pub resample_ms: f64,
     pub timestamp: TimestampMode,
+    /// Add a `CanId` column with the frame's CAN ID (per-frame layout only).
+    pub keep_can_id: bool,
+    /// When false, a frame whose CAN ID is missing from the DBC aborts the
+    /// conversion with an error naming the ID. When true (default), unknown
+    /// IDs are silently skipped.
+    pub skip_unknown_ids: bool,
+    /// When false, refuse to replace an existing output file.
+    pub overwrite: bool,
+    /// Restrict the output to these column names (see `decode::list_columns`).
+    /// `None` exports every signal in the DBC.
+    pub signal_filter: Option<HashSet<String>>,
 }
 
 impl Default for ConvertOptions {
@@ -49,6 +61,10 @@ impl Default for ConvertOptions {
             layout: OutputLayout::Resampled,
             resample_ms: 100.0,
             timestamp: TimestampMode::RelativeSeconds,
+            keep_can_id: false,
+            skip_unknown_ids: true,
+            overwrite: true,
+            signal_filter: None,
         }
     }
 }
@@ -70,6 +86,13 @@ impl Progress {
             (self.bytes_read as f64 / self.total_bytes as f64).min(1.0) as f32
         }
     }
+}
+
+/// Periodic progress report passed to the progress callback.
+pub struct ProgressUpdate<'a> {
+    pub progress: Progress,
+    /// DBC name of the most recently decoded message, when known.
+    pub current_message: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +122,7 @@ pub fn convert(
     dbc_path: &Path,
     out_dir: &Path,
     options: ConvertOptions,
-    progress: &mut dyn FnMut(Progress),
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
 ) -> Result<Summary> {
     if options.layout == OutputLayout::Resampled
         && (!options.resample_ms.is_finite() || options.resample_ms <= 0.0)
@@ -113,7 +136,10 @@ pub fn convert(
             dbc_path.display()
         );
     }
-    let decoder = Decoder::new(&dbc);
+    let decoder = Decoder::with_filter(&dbc, options.signal_filter.as_ref());
+    if decoder.columns().is_empty() {
+        bail!("no signals selected for export");
+    }
 
     let file = File::open(blf_path)
         .with_context(|| format!("failed to open BLF file {}", blf_path.display()))?;
@@ -127,9 +153,22 @@ pub fn convert(
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create output folder {}", out_dir.display()))?;
     let out_path = output_path(blf_path, out_dir, options.format);
+    if !options.overwrite && out_path.exists() {
+        bail!("output file already exists: {}", out_path.display());
+    }
+
+    // The CanId column only makes sense per frame; a forward-filled grid row
+    // mixes many messages.
+    let keep_can_id = options.keep_can_id && options.layout == OutputLayout::PerFrame;
+    let mut header: Vec<String> = Vec::with_capacity(decoder.columns().len() + 1);
+    if keep_can_id {
+        header.push("CanId".to_string());
+    }
+    header.extend(decoder.columns().iter().cloned());
+
     let mut exporter: Box<dyn Exporter> = match options.format {
-        OutputFormat::Csv => Box::new(CsvExporter::create(&out_path, decoder.columns())?),
-        OutputFormat::Parquet => Box::new(ParquetExporter::create(&out_path, decoder.columns())?),
+        OutputFormat::Csv => Box::new(CsvExporter::create(&out_path, &header)?),
+        OutputFormat::Parquet => Box::new(ParquetExporter::create(&out_path, &header)?),
     };
 
     let mut resampler = match options.layout {
@@ -146,6 +185,10 @@ pub fn convert(
     };
     let mut rows_written: u64 = 0;
     let mut cells: Vec<(usize, f64)> = Vec::new();
+    let mut row: Vec<(usize, f64)> = Vec::new();
+    let mut last_decoded_key: Option<(u32, bool)> = None;
+    let mut last_frame_for_name: Option<crate::blf::CanFrame> = None;
+
     while let Some(frame) = reader.next_frame()? {
         state.frames_read += 1;
         if decoder.decode(&frame, &mut cells) {
@@ -153,31 +196,56 @@ pub fn convert(
             let timestamp = time_base + frame.timestamp_ns as f64 / 1e9;
             match &mut resampler {
                 Some(resampler) => {
-                    resampler.push(timestamp, &cells, &mut |ts, row| {
+                    resampler.push(timestamp, &cells, &mut |ts, grid_row| {
                         rows_written += 1;
-                        exporter.write_row(ts, row)
+                        exporter.write_row(ts, grid_row)
                     })?;
                 }
                 None => {
                     rows_written += 1;
-                    exporter.write_row(timestamp, &cells)?;
+                    if keep_can_id {
+                        row.clear();
+                        row.push((0, frame.id as f64));
+                        row.extend(cells.iter().map(|&(c, v)| (c + 1, v)));
+                        exporter.write_row(timestamp, &row)?;
+                    } else {
+                        exporter.write_row(timestamp, &cells)?;
+                    }
                 }
             }
+            if last_decoded_key != Some((frame.id, frame.is_extended)) {
+                last_decoded_key = Some((frame.id, frame.is_extended));
+                last_frame_for_name = Some(frame.clone());
+            }
+        } else if !options.skip_unknown_ids && !frame.is_remote && !decoder.contains_id(&frame) {
+            bail!(
+                "DBC does not contain message 0x{:X}{}",
+                frame.id,
+                if frame.is_extended { " (extended)" } else { "" }
+            );
         }
         if state.frames_read.is_multiple_of(4096) {
             state.bytes_read = reader.bytes_read();
-            progress(state);
+            progress(ProgressUpdate {
+                progress: state,
+                current_message: last_frame_for_name
+                    .as_ref()
+                    .and_then(|f| decoder.message_name(f)),
+            });
         }
     }
     if let Some(resampler) = &mut resampler {
-        resampler.finish(&mut |ts, row| {
+        resampler.finish(&mut |ts, grid_row| {
             rows_written += 1;
-            exporter.write_row(ts, row)
+            exporter.write_row(ts, grid_row)
         })?;
     }
     exporter.finish()?;
     state.bytes_read = reader.bytes_read();
-    progress(state);
+    progress(ProgressUpdate {
+        progress: state,
+        current_message: None,
+    });
 
     Ok(Summary {
         output_path: out_path,

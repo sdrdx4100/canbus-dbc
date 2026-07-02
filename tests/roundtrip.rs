@@ -221,14 +221,89 @@ fn progress_reaches_completion() {
         &fx.dbc,
         &fx.dir,
         raw_epoch(OutputFormat::Csv),
-        &mut |p| {
-            last = Some(p);
+        &mut |u| {
+            last = Some(u.progress);
         },
     )
     .unwrap();
     let last = last.unwrap();
     assert_eq!(last.bytes_read, last.total_bytes);
     assert!((last.fraction() - 1.0).abs() < f32::EPSILON);
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn strict_mode_errors_on_unknown_id() {
+    let fx = setup("strict");
+    let options = ConvertOptions {
+        skip_unknown_ids: false,
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let err = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("0x700"), "{err}");
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn no_overwrite_refuses_existing_output() {
+    let fx = setup("overwrite");
+    convert(
+        &fx.blf,
+        &fx.dbc,
+        &fx.dir,
+        raw_epoch(OutputFormat::Csv),
+        &mut |_| {},
+    )
+    .unwrap();
+    let options = ConvertOptions {
+        overwrite: false,
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let err = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn can_id_column_in_raw_layout() {
+    let fx = setup("canid");
+    let options = ConvertOptions {
+        keep_can_id: true,
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let summary = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |_| {}).unwrap();
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        "Timestamp,CanId,EngineSpeed,EngineTemp,VehicleSpeed"
+    );
+    let row1: Vec<&str> = lines[1].split(',').collect();
+    assert_eq!(row1[1].parse::<f64>().unwrap(), 256.0);
+    assert_eq!(row1[2].parse::<f64>().unwrap(), 836.0);
+    let row2: Vec<&str> = lines[2].split(',').collect();
+    assert_eq!(row2[1].parse::<f64>().unwrap(), 512.0);
+    std::fs::remove_dir_all(&fx.dir).ok();
+}
+
+#[test]
+fn signal_filter_limits_output_columns() {
+    let fx = setup("filter");
+    let filter: std::collections::HashSet<String> = ["EngineSpeed", "VehicleSpeed"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let options = ConvertOptions {
+        signal_filter: Some(filter),
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let summary = convert(&fx.blf, &fx.dbc, &fx.dir, options, &mut |_| {}).unwrap();
+    assert_eq!(summary.signal_columns, 2);
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    assert_eq!(
+        text.lines().next().unwrap(),
+        "Timestamp,EngineSpeed,VehicleSpeed"
+    );
     std::fs::remove_dir_all(&fx.dir).ok();
 }
 
