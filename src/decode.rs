@@ -9,20 +9,37 @@ use crate::blf::CanFrame;
 use crate::dbc::{ByteOrder, Dbc, MuxRole, SignalDef, ValueType};
 use std::collections::{HashMap, HashSet};
 
+/// How output columns are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnNaming {
+    /// Signal name only, qualified as `Message.Signal` when the signal name
+    /// appears in more than one message.
+    #[default]
+    Signal,
+    /// `Message::Signal[unit]` for every column (unit omitted when empty),
+    /// matching the naming used by common CAN analysis tools.
+    MessageSignalUnit,
+}
+
 /// One output column as derived from the DBC (before any filtering).
 #[derive(Debug, Clone)]
 pub struct ColumnSpec {
-    /// Column name: the signal name, qualified as `Message.Signal` when the
-    /// signal name appears in more than one message.
+    /// Final column name in the chosen naming style.
     pub name: String,
     /// Name of the message the signal belongs to.
     pub message: String,
 }
 
+/// Column names (with their message) in DBC declaration order, using the
+/// default `Signal` naming.
+pub fn list_columns(dbc: &Dbc) -> Vec<ColumnSpec> {
+    list_columns_with(dbc, ColumnNaming::Signal)
+}
+
 /// Column names (with their message) in DBC declaration order. This is what
 /// a UI should present for signal selection; pass the chosen `name`s back via
-/// `Decoder::with_filter`.
-pub fn list_columns(dbc: &Dbc) -> Vec<ColumnSpec> {
+/// `Decoder::with_options`.
+pub fn list_columns_with(dbc: &Dbc, naming: ColumnNaming) -> Vec<ColumnSpec> {
     let mut name_count: HashMap<&str, u32> = HashMap::new();
     for message in &dbc.messages {
         for signal in &message.signals {
@@ -32,10 +49,21 @@ pub fn list_columns(dbc: &Dbc) -> Vec<ColumnSpec> {
     let mut columns = Vec::new();
     for message in &dbc.messages {
         for signal in &message.signals {
-            let name = if name_count[signal.name.as_str()] > 1 {
-                format!("{}.{}", message.name, signal.name)
-            } else {
-                signal.name.clone()
+            let name = match naming {
+                ColumnNaming::Signal => {
+                    if name_count[signal.name.as_str()] > 1 {
+                        format!("{}.{}", message.name, signal.name)
+                    } else {
+                        signal.name.clone()
+                    }
+                }
+                ColumnNaming::MessageSignalUnit => {
+                    if signal.unit.is_empty() {
+                        format!("{}::{}", message.name, signal.name)
+                    } else {
+                        format!("{}::{}[{}]", message.name, signal.name, signal.unit)
+                    }
+                }
             };
             columns.push(ColumnSpec {
                 name,
@@ -44,6 +72,18 @@ pub fn list_columns(dbc: &Dbc) -> Vec<ColumnSpec> {
         }
     }
     columns
+}
+
+/// SAE J1939 parameter group number of a 29-bit identifier. For PDU1
+/// (destination-specific, PF < 240) the PS byte is the destination address
+/// and is excluded; for PDU2 it is part of the PGN.
+fn j1939_pgn(id29: u32) -> u32 {
+    let pf = (id29 >> 16) & 0xFF;
+    if pf < 240 {
+        (id29 >> 8) & 0x3FF00
+    } else {
+        (id29 >> 8) & 0x3FFFF
+    }
 }
 
 struct BoundSignal {
@@ -59,27 +99,51 @@ struct BoundMessage {
     switch: Option<SignalDef>,
 }
 
+/// Decoder construction options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecoderOptions<'a> {
+    /// Restrict output to these column names (see [`list_columns_with`]).
+    pub filter: Option<&'a HashSet<String>>,
+    pub naming: ColumnNaming,
+    /// Match extended frames by J1939 PGN when the exact 29-bit ID is not in
+    /// the DBC (priority and source address often differ from the database).
+    pub j1939_pgn_fallback: bool,
+}
+
 pub struct Decoder {
     columns: Vec<String>,
     /// Keyed by (id | extended-bit) for O(1) frame lookup.
     messages: HashMap<u32, BoundMessage>,
+    /// J1939 PGN -> exact key in `messages`, for fallback matching.
+    pgn_map: HashMap<u32, u32>,
+    j1939_pgn_fallback: bool,
 }
 
 const EXT_KEY_BIT: u32 = 0x8000_0000;
 
 impl Decoder {
     pub fn new(dbc: &Dbc) -> Self {
-        Self::with_filter(dbc, None)
+        Self::with_options(dbc, DecoderOptions::default())
     }
 
-    /// Build a decoder whose output is restricted to the given column names
-    /// (as produced by [`list_columns`]). `None` exports everything.
+    /// Backwards-compatible constructor: default naming, no J1939 fallback.
     pub fn with_filter(dbc: &Dbc, filter: Option<&HashSet<String>>) -> Self {
-        let specs = list_columns(dbc);
+        Self::with_options(
+            dbc,
+            DecoderOptions {
+                filter,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with_options(dbc: &Dbc, options: DecoderOptions<'_>) -> Self {
+        let specs = list_columns_with(dbc, options.naming);
         let mut spec_iter = specs.into_iter();
 
         let mut columns: Vec<String> = Vec::new();
         let mut messages = HashMap::new();
+        let mut pgn_map = HashMap::new();
         for message in &dbc.messages {
             let mut bound = BoundMessage {
                 name: message.name.clone(),
@@ -91,7 +155,7 @@ impl Decoder {
                 if signal.mux == MuxRole::Switch {
                     bound.switch = Some(signal.clone());
                 }
-                let selected = filter.is_none_or(|f| f.contains(&spec.name));
+                let selected = options.filter.is_none_or(|f| f.contains(&spec.name));
                 if selected {
                     bound.signals.push(BoundSignal {
                         def: signal.clone(),
@@ -101,9 +165,17 @@ impl Decoder {
                 }
             }
             let key = message.id | if message.is_extended { EXT_KEY_BIT } else { 0 };
+            if message.is_extended {
+                pgn_map.entry(j1939_pgn(message.id)).or_insert(key);
+            }
             messages.insert(key, bound);
         }
-        Decoder { columns, messages }
+        Decoder {
+            columns,
+            messages,
+            pgn_map,
+            j1939_pgn_fallback: options.j1939_pgn_fallback,
+        }
     }
 
     /// Output column names (excluding the leading Timestamp column).
@@ -113,7 +185,14 @@ impl Decoder {
 
     fn lookup(&self, frame: &CanFrame) -> Option<&BoundMessage> {
         let key = frame.id | if frame.is_extended { EXT_KEY_BIT } else { 0 };
-        self.messages.get(&key)
+        if let Some(found) = self.messages.get(&key) {
+            return Some(found);
+        }
+        if self.j1939_pgn_fallback && frame.is_extended {
+            let pgn_key = self.pgn_map.get(&j1939_pgn(frame.id))?;
+            return self.messages.get(pgn_key);
+        }
+        None
     }
 
     /// True when the frame's CAN ID is defined in the DBC.
@@ -367,6 +446,54 @@ mod tests {
         assert!(out.is_empty()); // switch=0 selects A, B not present
         d.decode(&frame(768, false, &[0x01, 42]), &mut out);
         assert_eq!(out, vec![(0, 42.0)]);
+    }
+
+    #[test]
+    fn j1939_pgn_fallback_matches_other_priority_and_source() {
+        // DBC: EEC1 as 0x8CF004FE (prio 3, PGN 0xF004, SA 0xFE).
+        let text =
+            "BO_ 2364540158 EEC1: 8 X\n SG_ EngSpeed : 24|16@1+ (0.125,0) [0|8031.875] \"rpm\" X\n";
+        let dbc = Dbc::parse(text).unwrap();
+        let d = Decoder::with_options(
+            &dbc,
+            DecoderOptions {
+                j1939_pgn_fallback: true,
+                ..Default::default()
+            },
+        );
+        let mut out = Vec::new();
+        let data = [0, 0, 0, 0x20, 0x1A, 0, 0, 0]; // EngSpeed raw 0x1A20 -> 836 rpm
+
+        // Different source address (0x00 instead of 0xFE).
+        assert!(d.decode(&frame(0x0CF00400, true, &data), &mut out));
+        assert_eq!(out, vec![(0, 836.0)]);
+        // Different priority (6 instead of 3).
+        assert!(d.decode(&frame(0x18F004FE, true, &data), &mut out));
+        assert_eq!(out, vec![(0, 836.0)]);
+        // Different PGN must not match.
+        assert!(!d.decode(&frame(0x0CF005FE, true, &data), &mut out));
+
+        // Without the fallback only the exact ID matches.
+        let strict = Decoder::new(&dbc);
+        assert!(!strict.decode(&frame(0x0CF00400, true, &data), &mut out));
+        assert!(strict.decode(&frame(0x0CF004FE, true, &data), &mut out));
+    }
+
+    #[test]
+    fn message_signal_unit_naming() {
+        let text = "BO_ 2364540158 EEC1: 8 X\n SG_ EngSpeed : 24|16@1+ (0.125,0) [0|8031.875] \"rpm\" X\n SG_ NoUnit : 0|8@1+ (1,0) [0|0] \"\" X\n";
+        let dbc = Dbc::parse(text).unwrap();
+        let specs = list_columns_with(&dbc, ColumnNaming::MessageSignalUnit);
+        assert_eq!(specs[0].name, "EEC1::EngSpeed[rpm]");
+        assert_eq!(specs[1].name, "EEC1::NoUnit");
+        let d = Decoder::with_options(
+            &dbc,
+            DecoderOptions {
+                naming: ColumnNaming::MessageSignalUnit,
+                ..Default::default()
+            },
+        );
+        assert_eq!(d.columns(), &["EEC1::EngSpeed[rpm]", "EEC1::NoUnit"]);
     }
 
     #[test]

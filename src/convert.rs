@@ -2,7 +2,7 @@
 
 use crate::blf::BlfReader;
 use crate::dbc::Dbc;
-use crate::decode::Decoder;
+use crate::decode::{ColumnNaming, Decoder, DecoderOptions};
 use crate::export::csv::CsvExporter;
 use crate::export::parquet::ParquetExporter;
 use crate::export::{Exporter, OutputFormat};
@@ -55,6 +55,11 @@ pub struct ConvertOptions {
     /// Drop columns for signals that never carry a value in this BLF.
     /// Requires an extra scan pass over the input file.
     pub drop_empty_columns: bool,
+    /// Column naming style.
+    pub column_naming: ColumnNaming,
+    /// J1939 PGN matching for extended IDs (priority / source address in the
+    /// log may differ from the DBC). `None` = auto-detect from the DBC.
+    pub j1939: Option<bool>,
 }
 
 impl Default for ConvertOptions {
@@ -69,6 +74,8 @@ impl Default for ConvertOptions {
             overwrite: true,
             signal_filter: None,
             drop_empty_columns: false,
+            column_naming: ColumnNaming::default(),
+            j1939: None,
         }
     }
 }
@@ -190,7 +197,15 @@ pub fn convert(
             dbc_path.display()
         );
     }
-    let mut decoder = Decoder::with_filter(&dbc, options.signal_filter.as_ref());
+    let j1939 = options.j1939.unwrap_or(dbc.j1939_hint);
+    let mut decoder = Decoder::with_options(
+        &dbc,
+        DecoderOptions {
+            filter: options.signal_filter.as_ref(),
+            naming: options.column_naming,
+            j1939_pgn_fallback: j1939,
+        },
+    );
     if decoder.columns().is_empty() {
         bail!("no signals selected for export");
     }
@@ -212,7 +227,14 @@ pub fn convert(
         }
         dropped_empty_columns = decoder.columns().len() - kept.len();
         if dropped_empty_columns > 0 {
-            decoder = Decoder::with_filter(&dbc, Some(&kept));
+            decoder = Decoder::with_options(
+                &dbc,
+                DecoderOptions {
+                    filter: Some(&kept),
+                    naming: options.column_naming,
+                    j1939_pgn_fallback: j1939,
+                },
+            );
         }
     }
 

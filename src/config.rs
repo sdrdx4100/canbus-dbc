@@ -28,6 +28,8 @@ pub struct JobDefaults {
     pub skip_unknown: bool,
     pub overwrite: bool,
     pub drop_empty: bool,
+    /// Column names as Message::Signal[unit] instead of the signal name.
+    pub columns_full: bool,
 }
 
 impl Default for JobDefaults {
@@ -41,6 +43,7 @@ impl Default for JobDefaults {
             skip_unknown: true,
             overwrite: false,
             drop_empty: true,
+            columns_full: false,
         }
     }
 }

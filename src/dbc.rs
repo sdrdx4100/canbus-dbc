@@ -46,6 +46,8 @@ pub struct SignalDef {
     pub offset: f64,
     pub mux: MuxRole,
     pub value_type: ValueType,
+    /// Unit string from the DBC (e.g. "rpm"), may be empty.
+    pub unit: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +63,10 @@ pub struct MessageDef {
 #[derive(Debug, Default)]
 pub struct Dbc {
     pub messages: Vec<MessageDef>,
+    /// True when the file looks like an SAE J1939 database (VFrameFormat /
+    /// ProtocolType attributes). J1939 frames should be matched by PGN, not
+    /// by the full 29-bit identifier (priority and source address vary).
+    pub j1939_hint: bool,
 }
 
 impl Dbc {
@@ -151,7 +157,10 @@ impl Dbc {
             }
         }
 
-        Ok(Dbc { messages })
+        Ok(Dbc {
+            messages,
+            j1939_hint: text.contains("J1939"),
+        })
     }
 }
 
@@ -208,6 +217,18 @@ fn parse_signal(rest: &str) -> Result<SignalDef> {
     let factor: f64 = factor.parse().context("bad factor")?;
     let offset: f64 = offset.parse().context("bad offset")?;
 
+    // Unit: the first quoted string after the factor/offset parentheses,
+    // e.g. `[0|8031.875] "rpm" Vector__XXX`. Missing or empty is fine.
+    let unit = tail
+        .split_once(')')
+        .map(|(_, after)| after)
+        .and_then(|after| {
+            let start = after.find('"')? + 1;
+            let end = start + after[start..].find('"')?;
+            Some(after[start..end].to_string())
+        })
+        .unwrap_or_default();
+
     Ok(SignalDef {
         name,
         start_bit,
@@ -218,6 +239,7 @@ fn parse_signal(rest: &str) -> Result<SignalDef> {
         offset,
         mux,
         value_type: ValueType::Integer,
+        unit,
     })
 }
 
@@ -285,6 +307,21 @@ SIG_VALTYPE_ 1024 FloatSig : 1;
 
         let float_msg = &dbc.messages[4];
         assert_eq!(float_msg.signals[0].value_type, ValueType::Float);
+    }
+
+    #[test]
+    fn parses_units_and_j1939_hint() {
+        let dbc = Dbc::parse(SAMPLE).unwrap();
+        assert_eq!(dbc.messages[0].signals[0].unit, "rpm");
+        assert_eq!(dbc.messages[0].signals[1].unit, "degC");
+        assert_eq!(dbc.messages[1].signals[0].unit, "%");
+        assert!(!dbc.j1939_hint);
+
+        let j1939 = Dbc::parse(
+            "BA_DEF_ BO_ \"VFrameFormat\" ENUM \"StandardCAN\",\"J1939PG\";\nBO_ 2364540158 EEC1: 8 X\n SG_ EngSpeed : 24|16@1+ (0.125,0) [0|8031.875] \"rpm\" X\n",
+        )
+        .unwrap();
+        assert!(j1939.j1939_hint);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use blf_decoder::convert::{
     ConvertOptions, OutputLayout, Progress, ProgressUpdate, Summary, TimestampMode, convert,
 };
 use blf_decoder::dbc::Dbc;
-use blf_decoder::decode::{ColumnSpec, list_columns};
+use blf_decoder::decode::{ColumnNaming, ColumnSpec, list_columns_with};
 use blf_decoder::export::OutputFormat;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -123,6 +123,9 @@ struct Labels {
     overwrite: &'static str,
     drop_empty: &'static str,
     scanning: &'static str,
+    column_style: &'static str,
+    columns_signal: &'static str,
+    columns_full: &'static str,
     advanced: &'static str,
     layout_resample: &'static str,
     layout_raw: &'static str,
@@ -186,6 +189,9 @@ const JA: Labels = Labels {
     overwrite: "既存ファイルを上書き",
     drop_empty: "データのない信号列を除外",
     scanning: "スキャン中 (データのある信号を検出)...",
+    column_style: "列名",
+    columns_signal: "信号名のみ",
+    columns_full: "メッセージ::信号[単位]",
     advanced: "詳細設定",
     layout_resample: "等間隔サンプリング",
     layout_raw: "フレーム単位 (生データ)",
@@ -267,6 +273,9 @@ const EN: Labels = Labels {
     overwrite: "Overwrite existing files",
     drop_empty: "Exclude signals with no data",
     scanning: "Scanning (detecting signals with data)...",
+    column_style: "Column names",
+    columns_signal: "Signal name only",
+    columns_full: "Message::Signal[unit]",
     advanced: "Advanced",
     layout_resample: "Fixed-interval sampling",
     layout_raw: "Per frame (raw)",
@@ -350,6 +359,7 @@ struct Job {
     skip_unknown: bool,
     overwrite: bool,
     drop_empty: bool,
+    columns_full: bool,
     only_selected: bool,
     selected_signals: HashSet<String>,
     state: JobState,
@@ -385,6 +395,12 @@ impl Job {
             skip_unknown_ids: self.skip_unknown,
             overwrite: self.overwrite,
             drop_empty_columns: self.drop_empty,
+            column_naming: if self.columns_full {
+                ColumnNaming::MessageSignalUnit
+            } else {
+                ColumnNaming::Signal
+            },
+            j1939: None,
             signal_filter: if self.only_selected {
                 Some(self.selected_signals.clone())
             } else {
@@ -530,7 +546,7 @@ struct App {
     next_id: u64,
     run: Option<RunState>,
     log: Vec<String>,
-    signal_cache: HashMap<PathBuf, Result<Vec<ColumnSpec>, String>>,
+    signal_cache: HashMap<(PathBuf, bool), Result<Vec<ColumnSpec>, String>>,
     signal_search: String,
     show_settings: bool,
     show_about: bool,
@@ -606,6 +622,7 @@ impl App {
             skip_unknown: d.skip_unknown,
             overwrite: d.overwrite,
             drop_empty: d.drop_empty,
+            columns_full: d.columns_full,
             only_selected: false,
             selected_signals: HashSet::new(),
             state: JobState::Ready,
@@ -1131,6 +1148,16 @@ impl App {
                 ui.checkbox(&mut job.skip_unknown, labels.skip_unknown);
                 ui.checkbox(&mut job.overwrite, labels.overwrite);
                 ui.checkbox(&mut job.drop_empty, labels.drop_empty);
+                ui.horizontal(|ui| {
+                    ui.label(labels.column_style);
+                    let before = job.columns_full;
+                    ui.radio_value(&mut job.columns_full, false, labels.columns_signal);
+                    ui.radio_value(&mut job.columns_full, true, labels.columns_full);
+                    if before != job.columns_full {
+                        // Column names changed: reset the signal selection.
+                        job.selected_signals.clear();
+                    }
+                });
                 ui.checkbox(&mut job.only_selected, labels.only_selected);
 
                 egui::CollapsingHeader::new(labels.advanced)
@@ -1168,12 +1195,12 @@ impl App {
         }
 
         // Signal selection
-        let (only_selected, dbc_path) = self
+        let (only_selected, dbc_path, columns_full) = self
             .job(id)
-            .map(|j| (j.only_selected, j.dbc.clone()))
-            .unwrap_or((false, None));
+            .map(|j| (j.only_selected, j.dbc.clone(), j.columns_full))
+            .unwrap_or((false, None, false));
         if only_selected && let Some(dbc_path) = dbc_path {
-            self.signal_selection_ui(ui, id, &dbc_path, running);
+            self.signal_selection_ui(ui, id, &dbc_path, columns_full, running);
         }
     }
 
@@ -1181,7 +1208,7 @@ impl App {
         let Some(source) = self.job(source_id) else {
             return;
         };
-        let (fp, lr, im, rt, kc, su, ow, de, os, sel, dbc) = (
+        let (fp, lr, im, rt, kc, su, ow, de, cf, os, sel, dbc) = (
             source.format_parquet,
             source.layout_raw,
             source.interval_ms,
@@ -1190,6 +1217,7 @@ impl App {
             source.skip_unknown,
             source.overwrite,
             source.drop_empty,
+            source.columns_full,
             source.only_selected,
             source.selected_signals.clone(),
             source.dbc.clone(),
@@ -1207,6 +1235,7 @@ impl App {
             job.skip_unknown = su;
             job.overwrite = ow;
             job.drop_empty = de;
+            job.columns_full = cf;
             job.only_selected = os;
             job.selected_signals = sel.clone();
             job.out_dir = out_dir.clone();
@@ -1222,15 +1251,21 @@ impl App {
         ui: &mut egui::Ui,
         job_id: u64,
         dbc_path: &Path,
+        columns_full: bool,
         running: bool,
     ) {
         let labels = self.labels;
+        let naming = if columns_full {
+            ColumnNaming::MessageSignalUnit
+        } else {
+            ColumnNaming::Signal
+        };
         let specs = self
             .signal_cache
-            .entry(dbc_path.to_path_buf())
+            .entry((dbc_path.to_path_buf(), columns_full))
             .or_insert_with(|| {
                 Dbc::from_file(dbc_path)
-                    .map(|dbc| list_columns(&dbc))
+                    .map(|dbc| list_columns_with(&dbc, naming))
                     .map_err(|e| format!("{e:#}"))
             })
             .clone();
@@ -1436,6 +1471,15 @@ impl App {
                     .changed();
                 changed |= ui.checkbox(&mut d.overwrite, labels.overwrite).changed();
                 changed |= ui.checkbox(&mut d.drop_empty, labels.drop_empty).changed();
+                ui.horizontal(|ui| {
+                    ui.label(labels.column_style);
+                    changed |= ui
+                        .radio_value(&mut d.columns_full, false, labels.columns_signal)
+                        .changed();
+                    changed |= ui
+                        .radio_value(&mut d.columns_full, true, labels.columns_full)
+                        .changed();
+                });
             });
         if changed {
             self.config.save();

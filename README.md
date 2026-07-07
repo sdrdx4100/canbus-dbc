@@ -21,6 +21,7 @@ BLF(Vector Binary Logging Format)と DBC ファイルを入力し、CAN 信号�
   - Intel(リトルエンディアン)/ Motorola(ビッグエンディアン)両対応
   - Factor / Offset / Signed / Unsigned を適用
   - マルチプレクサ信号(M / m\<N\>)、IEEE float/double 信号(SIG_VALTYPE_)対応
+  - **SAE J1939 対応**: J1939 の DBC を自動検出し、優先度・送信元アドレスが異なるフレームも PGN で照合
   - CAN / CAN FD フレーム(CAN_MESSAGE, CAN_MESSAGE2, CAN_FD_MESSAGE, CAN_FD_MESSAGE_64)対応
 - **出力**: CSV または Parquet(SNAPPY 圧縮)
 - **GUI**: BLF / DBC / 出力フォルダ選択、出力形式選択、変換ボタン、進捗バー、エラー表示
@@ -28,7 +29,7 @@ BLF(Vector Binary Logging Format)と DBC ファイルを入力し、CAN 信号�
 
 ## 出力データ形式
 
-1 列目が `Timestamp`、2 列目以降が DBC で定義された Signal 名(例: `EngineSpeed`, `VehicleSpeed`)です。信号名が複数メッセージで重複する場合は `メッセージ名.信号名` の形式で区別されます。
+1 列目が `Timestamp`、2 列目以降が DBC で定義された Signal 名(例: `EngineSpeed`, `VehicleSpeed`)です。**列名スタイル**(選択可): 信号名のみ(重複時は `メッセージ名.信号名`)/ `メッセージ::信号[単位]`(例: `EEC1::EngSpeed[rpm]`、他の CAN 解析ツールの CSV と互換)。
 
 **データ形状**(選択可):
 
@@ -80,6 +81,8 @@ blf_decoder --blf input.blf --dbc database.dbc --out ./output
     [--interval-ms <n>]          サンプリング間隔(デフォルト: 100)
     [--timestamp relative|epoch] 時刻列(デフォルト: relative)
     [--drop-empty]               データのない信号列を除外
+    [--columns signal|full]      列名: 信号名のみ / メッセージ::信号[単位]
+    [--j1939 on|off]             J1939 PGN 照合(デフォルト: DBC から自動判定)
 ```
 
 ## ビルド

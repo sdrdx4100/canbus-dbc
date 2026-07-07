@@ -377,6 +377,52 @@ fn drop_empty_columns_errors_when_nothing_has_data() {
 }
 
 #[test]
+fn j1939_and_full_column_names() {
+    let dir = std::env::temp_dir().join(format!("blf_decoder_test_j1939_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // J1939 DBC: EEC1 stored as prio 3 / SA 0x00 (raw id 0x8CF00400).
+    let dbc_text = "BA_DEF_ BO_ \"VFrameFormat\" ENUM \"StandardCAN\",\"J1939PG\";\nBO_ 2364540158 EEC1: 8 X\n SG_ EngSpeed : 24|16@1+ (0.125,0) [0|8031.875] \"rpm\" X\n";
+    // Logged frame: prio 6, SA 0xFE -> exact ID differs, PGN matches.
+    let frame_id = 0x98F004FEu32; // extended bit + 0x18F004FE
+    let mut objects = Vec::new();
+    objects.extend_from_slice(&can_message(
+        100_000_000,
+        frame_id,
+        &[0, 0, 0, 0x20, 0x1A, 0, 0, 0], // EngSpeed raw 0x1A20 -> 836 rpm
+    ));
+    let mut blf_bytes = file_header();
+    blf_bytes.extend_from_slice(&container(&objects));
+    let blf = dir.join("j1939.blf");
+    let dbc = dir.join("j1939.dbc");
+    std::fs::write(&blf, &blf_bytes).unwrap();
+    std::fs::write(&dbc, dbc_text).unwrap();
+
+    // Auto J1939 detection + Message::Signal[unit] column naming.
+    let options = ConvertOptions {
+        column_naming: blf_decoder::decode::ColumnNaming::MessageSignalUnit,
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let summary = convert(&blf, &dbc, &dir, options, &mut |_| {}).unwrap();
+    assert_eq!(summary.frames_decoded, 1);
+    let text = std::fs::read_to_string(&summary.output_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Timestamp,EEC1::EngSpeed[rpm]");
+    let row: Vec<&str> = lines[1].split(',').collect();
+    assert_eq!(row[1].parse::<f64>().unwrap(), 836.0);
+
+    // Forcing J1939 off restores exact-ID matching (frame no longer decodes).
+    let options = ConvertOptions {
+        j1939: Some(false),
+        ..raw_epoch(OutputFormat::Csv)
+    };
+    let summary = convert(&blf, &dbc, &dir, options, &mut |_| {}).unwrap();
+    assert_eq!(summary.frames_decoded, 0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn resampled_csv_forward_fills() {
     let fx = setup("resample");
     // Frames: Engine @0.1s (836 rpm, -10 degC), Vehicle @0.2s (60 km/h).
